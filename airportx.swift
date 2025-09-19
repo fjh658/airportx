@@ -98,6 +98,8 @@ private struct Ansi {
     static func dim(_ text: String) -> String { wrap(text, code: "2") }
     static func cyan(_ text: String) -> String { wrap(text, code: "36") }
     static func green(_ text: String) -> String { wrap(text, code: "32") }
+    static func yellow(_ text: String) -> String { wrap(text, code: "33") }
+    static func magenta(_ text: String) -> String { wrap(text, code: "35") }
 }
 
 /// Represent the consolidated Wi-Fi state emitted by the resolver. The struct is
@@ -455,6 +457,41 @@ private enum EnvironmentReader {
 
     private static func isTunnelInterface(_ iface: String) -> Bool {
         return iface.hasPrefix("utun")
+    }
+
+    static func classification(for iface: String, store: SCDynamicStore) -> String {
+        if isTunnelInterface(iface) { return "VPN" }
+        if isWiFiInterface(iface: iface, store: store) { return "Wi-Fi" }
+        if let type = interfaceType(iface: iface) {
+            let ethernet = kSCNetworkInterfaceTypeEthernet as String
+            if type == ethernet { return "wired" }
+            let firewire = kSCNetworkInterfaceTypeFireWire as String
+            if type == firewire { return "FireWire" }
+            let bluetooth = kSCNetworkInterfaceTypeBluetooth as String
+            if type == bluetooth { return "Bluetooth" }
+            let ppp = kSCNetworkInterfaceTypePPP as String
+            let l2tp = kSCNetworkInterfaceTypeL2TP as String
+            let ipsec = kSCNetworkInterfaceTypeIPSec as String
+            if type == ppp || type == l2tp || type == ipsec { return "VPN" }
+        }
+        if iface.hasPrefix("bridge") { return "bridge" }
+        if iface.hasPrefix("en") { return "wired" }
+        return "other"
+    }
+
+    static func isTunnel(_ iface: String) -> Bool {
+        return isTunnelInterface(iface)
+    }
+
+    private static func interfaceType(iface: String) -> String? {
+        guard let all = SCNetworkInterfaceCopyAll() as? [SCNetworkInterface] else { return nil }
+        for ifaceRef in all {
+            if let name = SCNetworkInterfaceGetBSDName(ifaceRef) as String?, name == iface,
+               let type = SCNetworkInterfaceGetInterfaceType(ifaceRef) as String? {
+                return type
+            }
+        }
+        return nil
     }
 }
 
@@ -1120,9 +1157,107 @@ private struct JSONColor {
 
 /// Builds the human-readable diagnostics banner printed in `-v` mode so users
 /// can understand how interface selection and data fusion were performed.
+private func activeInterfaceSummaryLine() -> String? {
+    guard let store = SCDynamicStoreCreate(kCFAllocatorDefault, "airportx-diag" as CFString, nil, nil) else { return nil }
+
+    var ptr: UnsafeMutablePointer<ifaddrs>? = nil
+    guard getifaddrs(&ptr) == 0, let head = ptr else { return nil }
+    defer { freeifaddrs(ptr) }
+
+    struct Item { let name: String }
+    var seen: Set<String> = []
+    var items: [Item] = []
+
+    var current = head
+    while true {
+        let entry = current.pointee
+        if let address = entry.ifa_addr, address.pointee.sa_family == UInt8(AF_INET) {
+            let flags = UInt32(entry.ifa_flags)
+            if (flags & UInt32(IFF_UP)) != 0 && (flags & UInt32(IFF_LOOPBACK)) == 0 {
+                let name = String(cString: entry.ifa_name)
+                if !name.isEmpty && seen.insert(name).inserted {
+                    items.append(Item(name: name))
+                }
+            }
+        }
+        if let next = entry.ifa_next {
+            current = next
+        } else {
+            break
+        }
+    }
+
+    if items.isEmpty { return nil }
+
+    var interfaceToService: [String: String] = [:]
+    let servicePattern = "State:/Network/Service/.*/IPv4" as CFString
+    if let keys = SCDynamicStoreCopyKeyList(store, servicePattern) as? [String] {
+        for key in keys {
+            guard let dict = SCDynamicStoreCopyValue(store, key as CFString) as? [String: Any],
+                  let iface = dict["InterfaceName"] as? String else { continue }
+            if interfaceToService[iface] != nil { continue }
+            if let range1 = key.range(of: "Service/"), let range2 = key.range(of: "/IPv4"), range1.upperBound < range2.lowerBound {
+                let sid = String(key[range1.upperBound..<range2.lowerBound])
+                interfaceToService[iface] = sid
+            }
+        }
+    }
+
+    var servicePriority: [String: Int] = [:]
+    if let setup = SCDynamicStoreCopyValue(store, "Setup:/Network/Global/IPv4" as CFString) as? [String: Any],
+       let order = setup["ServiceOrder"] as? [String] {
+        for (index, sid) in order.enumerated() {
+            servicePriority[sid] = index
+        }
+    }
+
+    func priority(for name: String) -> Int {
+        if EnvironmentReader.isTunnel(name) { return -100 }
+        if let sid = interfaceToService[name], let index = servicePriority[sid] { return index }
+        return Int.max - 100
+    }
+
+    items.sort {
+        let lhsPriority = priority(for: $0.name)
+        let rhsPriority = priority(for: $1.name)
+        if lhsPriority != rhsPriority { return lhsPriority < rhsPriority }
+        return $0.name < $1.name
+    }
+
+    let parts = items.map { item -> String in
+        let label = EnvironmentReader.classification(for: item.name, store: store)
+        let coloredName = Ansi.cyan(item.name)
+        let lower = label.lowercased()
+        let coloredLabel: String
+        switch lower {
+        case "wi-fi":
+            coloredLabel = Ansi.green(label)
+        case "wired":
+            coloredLabel = Ansi.yellow(label)
+        case "vpn":
+            coloredLabel = Ansi.magenta(label)
+        case "bluetooth":
+            coloredLabel = Ansi.magenta(label)
+        case "firewire":
+            coloredLabel = Ansi.yellow(label)
+        case "bridge":
+            coloredLabel = Ansi.dim(label)
+        default:
+            coloredLabel = Ansi.dim(label)
+        }
+        return "\(coloredName)[\(coloredLabel)]"
+    }
+
+    return parts.isEmpty ? nil : parts.joined(separator: " ")
+}
+
 private func verboseReport(snapshot: WiFiSnapshot, preferIface: String, strict: Bool) -> String {
     var lines: [String] = []
+    let summary = activeInterfaceSummaryLine()
     lines.append(Ansi.bold("airportx diagnostics"))
+    if let summary = summary {
+        lines.append("Network interfaces: \(summary)")
+    }
     let iface = snapshot.iface.isEmpty ? "-" : snapshot.iface
     lines.append("iface=\(Ansi.cyan(iface))  serviceID=\(snapshot.serviceID ?? "-")")
     let router = snapshot.routerIPv4 ?? "-"
