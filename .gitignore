@@ -1,0 +1,6 @@
+*.xcuserstate
+UserInterfaceState.xcuserstate
+.build/
+.swiftpm/
+.swift_module_cache/
+airportx
