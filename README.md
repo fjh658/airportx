@@ -30,17 +30,9 @@ brew tap fjh658/airportx https://github.com/fjh658/airportx
 brew install fjh658/airportx/airportx
 ```
 
-During `brew install`, the formula compiles `airportx.swift` and then elevates
-`${HOMEBREW_PREFIX}/bin/airportx` so it can read the system known-networks plist
-without needing `sudo` each time:
-
-```bash
-sudo chown root $(which airportx)
-sudo chmod 4755 $(which airportx)
-```
-
-If those commands fail (for example due to corporate security policies), the
-formula prints instructions so you can re-run them manually.
+During `brew install`, the formula compiles `airportx.swift`. No elevation is performed.
+`airportx` runs without privileges. If the Known Networks fallback cannot be read,
+those fields will simply be omitted.
 
 ### Build from source
 
@@ -48,14 +40,11 @@ formula prints instructions so you can re-run them manually.
 # Universal binary (x86_64 + arm64)
 make universal
 
-# Optional: install and raise privileges manually
-sudo install -m 0755 airportx /usr/local/bin/airportx
-sudo chown root:wheel /usr/local/bin/airportx
-sudo chmod u+s /usr/local/bin/airportx
+# Install
+install -m 0755 airportx /usr/local/bin/airportx
 ```
 
-The resulting binary targets macOS 10.13+ (x86_64) and 11.0+ (arm64). Remove the
-setuid bit if you prefer to invoke `sudo airportx` on demand.
+The resulting binary targets macOS 10.13+ (x86_64) and 11.0+ (arm64). The tool never elevates; if the Known Networks fallback cannot be read, those fields will be omitted.
 
 ### Swift Package Manager
 
@@ -92,7 +81,7 @@ Options:
 ### JSON detail example
 
 ```bash
-sudo airportx --json --detail
+airportx --json --detail
 {
   "iface" : "en0",
   "ifaceSource" : "SystemConfiguration",
@@ -131,8 +120,7 @@ sudo airportx --json --detail
 ## Security considerations
 
 - No CoreLocation calls and no private `airport` binary usage.
-- Known-networks plist read is the only privileged operation. If you do not set
-  the binary to setuid, run `sudo airportx …` when you need it.
+- Known-networks plist read is only attempted as a last resort. If access is denied, those fields will remain unset or come from other sources. `airportx` does not elevate.
 - The tool does **not** mutate Wi‑Fi state. All data access is read-only.
 
 ## Development
@@ -143,7 +131,6 @@ swiftc airportx.swift -o airportx
 OR
 make universal
 
-sudo chown root ./airportx && sudo chmod +s ./airportx
 ./airportx --json --detail
 ```
 

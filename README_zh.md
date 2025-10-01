@@ -21,14 +21,7 @@ brew tap fjh658/airportx https://github.com/fjh658/airportx
 brew install fjh658/airportx/airportx
 ```
 
-安装过程中，公式会自动编译 `airportx.swift`，并在 `${HOMEBREW_PREFIX}/bin/airportx` 上执行：
-
-```bash
-sudo chown root $(which airportx)
-sudo chmod 4755 $(which airportx)
-```
-
-这样普通用户即可直接运行 `airportx`，无需每次再输入 `sudo`。若命令因权限策略失败，终端会提示你手动执行。
+安装后即可直接运行 `airportx`。工具不会尝试提升权限；如果系统拒绝访问已知网络数据库（Known Networks），相应字段会被省略。
 
 ### 从源码构建
 
@@ -36,13 +29,9 @@ sudo chmod 4755 $(which airportx)
 # 生成 x86_64 + arm64 双架构二进制
 make universal
 
-# 可选：安装到 /usr/local/bin，并设置 setuid（按需谨慎操作）
-sudo install -m 0755 airportx /usr/local/bin/airportx
-sudo chown root:wheel /usr/local/bin/airportx
-sudo chmod u+s /usr/local/bin/airportx
+# 可选：拷贝到 PATH（示例）
+install -m 0755 airportx /usr/local/bin/airportx
 ```
-
-如不设置 setuid，可以保留普通权限，使用时执行 `sudo airportx …`。
 
 ### Swift Package Manager
 
@@ -78,7 +67,7 @@ airportx [options] [iface]
 ### JSON + 溯源示例
 
 ```bash
-sudo airportx --json --detail
+airportx --json --detail
 {
   "iface" : "en0",
   "ifaceSource" : "SystemConfiguration",
@@ -98,7 +87,7 @@ sudo airportx --json --detail
 | `KnownNetworks`        | 根据 `/Library/Preferences/com.apple.wifi.known-networks.plist` 推断 |
 | `LeaseFile`            | 从 `/var/db/dhcpclient/leases` 读取的历史 DHCP 信息          |
 | `Heuristic`            | 无法获取权威数据时的推测（如 DHCP server ≈ Router）         |
-| `Derived`              | 由其它字段推导出的数值（如 band、SNR）                       |
+| `Derived`              | 由其它字段推导出的数值（如频段和 SNR）                       |
 
 ## 工作原理
 
@@ -111,18 +100,17 @@ sudo airportx --json --detail
 ## 安全注意事项
 
 - 不调用 CoreLocation，不依赖私有 `airport` 工具。
-- known-networks plist 读取完成后即刻放弃提权。
-- 若不希望二进制保持 setuid，可保留普通权限并在运行时使用 `sudo`。
+- 程序不会尝试提升权限；仅在可访问时读取系统已知网络（Known Networks），无法访问则跳过。
+- 使用 `airportx` 不需要 `sudo`。
 
 ## 开发者提示
 
 ```bash
 swiftc -typecheck -parse-as-library airportx.swift
 swiftc airportx.swift -o airportx
-OR
+# 或者：
 make universal
 
-sudo chown root ./airportx && sudo chmod +s ./airportx
 ./airportx --json --detail
 ```
 
