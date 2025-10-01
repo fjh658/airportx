@@ -6,7 +6,7 @@ class Airportx < Formula
     Pathname.new(__dir__).join("../dist/airportx-0.0.1-universal.tar.gz").realpath.to_s
   end
   url "file://#{Airportx.local_tarball}"
-  sha256 "e668e76e0c256071ae0ac5d9903655175e7c23bf9d8439c39aab95be902bccf7"
+  sha256 "685b2494cc2872a7eada9c9787db83f53f8f43e65e9d645134134be2bbb07282"
   head "https://github.com/fjh658/airportx.git", branch: "main"
 
   def install
