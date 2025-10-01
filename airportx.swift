@@ -109,6 +109,7 @@ private struct WiFiSnapshot {
     var iface: String = ""
     var serviceID: String?
     var ssid: String?
+    var ssidLastSeen: Date?
     var bssid: String?
     var channel: Int?
     var band: String?
@@ -213,7 +214,12 @@ private final class WiFiResolver {
 
         #if canImport(CoreWLAN)
         if liveCoreWLAN && env.isWiFi {
-            CoreWLANReader.populate(into: &snapshot, sources: &sources, iface: env.iface, allowFallback: !strict)
+            CoreWLANReader.populate(into: &snapshot,
+                                    sources: &sources,
+                                    iface: env.iface,
+                                    allowFallback: !strict,
+                                    expectedRouter: env.routerIPv4,
+                                    expectedDHCP: env.dhcpServerIPv4)
         }
         #endif
 
@@ -681,9 +687,14 @@ private enum LeaseFileReader {
 
 /// Optional live enrichment via CoreWLAN. All reads are safe (no scans) and the
 /// resolver gracefully degrades when CoreWLAN is unavailable.
-#if canImport(CoreWLAN)
+ #if canImport(CoreWLAN)
 private enum CoreWLANReader {
-    static func populate(into snapshot: inout WiFiSnapshot, sources: inout FieldSources, iface: String, allowFallback: Bool) {
+    static func populate(into snapshot: inout WiFiSnapshot,
+                         sources: inout FieldSources,
+                         iface: String,
+                         allowFallback: Bool,
+                         expectedRouter: String?,
+                         expectedDHCP: String?) {
         let client = CWWiFiClient.shared()
         let interface: CWInterface?
         if allowFallback {
@@ -693,16 +704,40 @@ private enum CoreWLANReader {
         }
         guard let cw = interface else { return }
 
+        // Capture channel first so we can score profile BSSIDs against it.
+        let expectedChannel: Int? = {
+            if let ch = cw.wlanChannel()?.channelNumber { return Int(ch) }
+            return nil
+        }()
+
+        if let ch = expectedChannel {
+            assignIfEmpty(&snapshot.channel, key: "channel", value: ch, origin: .coreWLAN, sources: &sources)
+        }
+
+        // Live SSID/BSSID
         assignIfEmpty(&snapshot.ssid, key: "ssid", value: cw.ssid(), origin: .coreWLAN, sources: &sources)
         if let bssidRaw = cw.bssid()?.lowercased(), !bssidRaw.isEmpty, bssidRaw != "00:00:00:00:00:00" {
             assignIfEmpty(&snapshot.bssid, key: "bssid", value: bssidRaw, origin: .coreWLAN, sources: &sources)
         }
+
+        // SSID from profiles when redacted
+        if (snapshot.ssid == nil || snapshot.ssid?.isEmpty == true),
+           let profileSSID = ssidFromProfiles(cw) {
+            assignIfEmpty(&snapshot.ssid, key: "ssid", value: profileSSID, origin: .coreWLAN, sources: &sources)
+        }
+
+        // BSSID from profiles ranked by DHCP match → router signature → channel → recency
+        if snapshot.bssid == nil,
+           let profileBSSID = bssidFromProfiles(cw,
+                                                expectedChannel: expectedChannel,
+                                                expectedRouter: expectedRouter,
+                                                expectedDHCP: expectedDHCP) {
+            assignIfEmpty(&snapshot.bssid, key: "bssid", value: profileBSSID, origin: .coreWLAN, sources: &sources)
+        }
+
         assignIfEmpty(&snapshot.rssi, key: "rssi", value: cw.rssiValue(), origin: .coreWLAN, sources: &sources)
         assignIfEmpty(&snapshot.noise, key: "noise", value: cw.noiseMeasurement(), origin: .coreWLAN, sources: &sources)
         assignIfEmpty(&snapshot.txRate, key: "txRate", value: cw.transmitRate(), origin: .coreWLAN, sources: &sources)
-        if let channel = cw.wlanChannel()?.channelNumber {
-            assignIfEmpty(&snapshot.channel, key: "channel", value: Int(channel), origin: .coreWLAN, sources: &sources)
-        }
         if let country = cw.countryCode(), let normalized = normalizedCountryCode(country) {
             assignIfEmpty(&snapshot.countryCode, key: "countryCode", value: normalized, origin: .coreWLAN, sources: &sources)
         }
@@ -712,6 +747,121 @@ private enum CoreWLANReader {
         if let phy = phyString(for: cw) {
             assignIfEmpty(&snapshot.phy, key: "phy", value: phy, origin: .coreWLAN, sources: &sources)
         }
+    }
+
+    // Pull SSID from saved profiles (public API; no scanning). Useful when cw.ssid() is redacted.
+    private static func ssidFromProfiles(_ cw: CWInterface) -> String? {
+        guard let cfg = cw.configuration(),
+              let set = (cfg.value(forKey: "networkProfiles") as? NSOrderedSet),
+              let first = set.firstObject as? CWNetworkProfile,
+              let raw = first.ssid, !raw.isEmpty else {
+            return nil
+        }
+        // Normalize smart quotes and whitespace to match our other sources.
+        return raw.replacingOccurrences(of: "’", with: "'")
+                  .replacingOccurrences(of: "‘", with: "'")
+                  .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // Ranked BSSID selection from profile: DHCP match > router signature > channel > recency
+    private static func bssidFromProfiles(_ cw: CWInterface,
+                                          expectedChannel: Int?,
+                                          expectedRouter: String?,
+                                          expectedDHCP: String?) -> String? {
+        guard let cfg = cw.configuration(),
+              let set = (cfg.value(forKey: "networkProfiles") as? NSOrderedSet) else {
+            return nil
+        }
+
+        // Filter to the profile matching the current SSID when available
+        let targetSSID: String? = cw.ssid().flatMap { normalizeSSIDLocal($0) }
+        let dhcpTarget: Data? = expectedDHCP.flatMap { ipv4Data(from: $0) }
+
+        var bestBSSID: String? = nil
+        var bestRank: Int = .min
+        var bestDate: Date = .distantPast
+
+        for case let profile as NSObject in set {
+            if let t = targetSSID,
+               let pSSID = (profile.value(forKey: "ssid") as? String).flatMap({ normalizeSSIDLocal($0) }),
+               !pSSID.isEmpty, pSSID != t {
+                continue
+            }
+
+            guard let list = profile.value(forKey: "bssidList") as? [[String: Any]] else { continue }
+            for entry in list {
+                guard let raw = (entry["BSSID"] as? String)?.lowercased(),
+                      let bssid = normalizeBSSIDString(raw) else { continue }
+
+                var rank = 0
+
+                // 1) Exact DHCP server match (strongest signal)
+                if let data = entry["DHCPServerID"] as? Data, let target = dhcpTarget, data == target {
+                    rank += 300
+                }
+
+                // 2) Router signature match
+                if rank < 300, let router = expectedRouter,
+                   let sig = entry["IPv4NetworkSignature"] as? String,
+                   sig.contains("IPv4.Router=\(router)") {
+                    rank += 200
+                }
+
+                // 3) Channel match
+                if let exp = expectedChannel {
+                    if let n = entry["Channel"] as? NSNumber, n.intValue == exp { rank += 100 }
+                    else if let n = entry["Channel"] as? Int, n == exp { rank += 100 }
+                }
+
+                // 4) Recency (prefer most recent association; accept multiple possible keys)
+                let ts = dateFromBSSIDEntry(entry) ?? .distantPast
+
+                if rank > bestRank || (rank == bestRank && ts > bestDate) {
+                    bestRank = rank
+                    bestDate = ts
+                    bestBSSID = bssid
+                }
+            }
+        }
+
+        return bestBSSID
+    }
+
+    // Extract a useful timestamp from a BSS entry; different macOS versions use different keys
+    @inline(__always)
+    private static func dateFromBSSIDEntry(_ entry: [String: Any]) -> Date? {
+        let keys = [
+            "LastAssociatedAt",
+            "lastAssociatedAt",
+            "LastJoinedAt",
+            "LastJoined",
+            "LastSeen",
+            "Timestamp",
+            "AWDLRealTimeModeTimestamp"
+        ]
+        var best: Date? = nil
+        for k in keys {
+            if let d = entry[k] as? Date {
+                if let cur = best {
+                    if d > cur { best = d }
+                } else {
+                    best = d
+                }
+            }
+        }
+        return best
+    }
+
+    @inline(__always) private static func normalizeSSIDLocal(_ text: String) -> String {
+        return text.replacingOccurrences(of: "’", with: "'")
+                   .replacingOccurrences(of: "‘", with: "'")
+                   .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    @inline(__always) private static func normalizeBSSIDString(_ raw: String) -> String? {
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !s.isEmpty, s != "00:00:00:00:00:00" else { return nil }
+        return s
     }
 
     private static func securityString(for interface: CWInterface) -> String? {
@@ -768,30 +918,42 @@ private enum KnownNetworksStore {
 
     static func enrich(into snapshot: inout WiFiSnapshot, sources: inout FieldSources, env: EnvironmentInfo) {
         guard env.isWiFi else { return }
+
+        // Determine if we need KnownNetworks at all *before* touching disk.
+        var needSSID = (snapshot.ssid == nil || snapshot.ssid?.isEmpty == true)
+        var needBSSID = (!needSSID && snapshot.bssid == nil)
+        var needSec = (!needSSID && (snapshot.security == nil || snapshot.phy == nil))
+
+        // If CoreWLAN/IORegistry already filled everything, skip loading.
+        if !(needSSID || needBSSID || needSec) { return }
+
+        // Lazy load the known-networks store only when required.
         guard let store = load() else { return }
 
-        if snapshot.ssid == nil || snapshot.ssid?.isEmpty == true {
-            if let inferred = inferSSID(store: store, env: env, currentChannel: snapshot.channel) {
-                assignIfEmpty(&snapshot.ssid, key: "ssid", value: inferred, origin: .knownNetworks, sources: &sources)
-            }
+        // 1) SSID inference first; it unlocks BSSID/security inference.
+        if needSSID, let inferred = inferSSID(store: store, env: env, currentChannel: snapshot.channel) {
+            assignIfEmpty(&snapshot.ssid, key: "ssid", value: inferred.value, origin: .knownNetworks, sources: &sources)
+            if snapshot.ssidLastSeen == nil { snapshot.ssidLastSeen = inferred.lastAssociated }
+            needSSID = false
+            needBSSID = (snapshot.bssid == nil)
+            needSec = (snapshot.security == nil || snapshot.phy == nil)
         }
 
-        if let ssid = snapshot.ssid, snapshot.bssid == nil {
-            if let bssid = inferBSSID(store: store, ssid: ssid, env: env, channel: snapshot.channel) {
-                assignIfEmpty(&snapshot.bssid, key: "bssid", value: bssid, origin: .knownNetworks, sources: &sources)
-            }
+        // 2) BSSID inference (requires SSID).
+        if needBSSID, let ssid = snapshot.ssid,
+           let bssid = inferBSSID(store: store, ssid: ssid, env: env, channel: snapshot.channel) {
+            assignIfEmpty(&snapshot.bssid, key: "bssid", value: bssid, origin: .knownNetworks, sources: &sources)
         }
 
-        if let ssid = snapshot.ssid, (snapshot.security == nil || snapshot.phy == nil) {
-            if let sec = fetchSecurity(store: store, ssid: ssid) {
-                if snapshot.security == nil, let security = sec.security {
-                    snapshot.security = security
-                    sources["security"] = FieldOrigin.knownNetworks.rawValue
-                }
-                if snapshot.phy == nil, let phy = sec.phy {
-                    snapshot.phy = phy
-                    sources["phy"] = FieldOrigin.knownNetworks.rawValue
-                }
+        // 3) Security/PHY (requires SSID).
+        if needSec, let ssid = snapshot.ssid, let sec = fetchSecurity(store: store, ssid: ssid) {
+            if snapshot.security == nil, let s = sec.security {
+                snapshot.security = s
+                sources["security"] = FieldOrigin.knownNetworks.rawValue
+            }
+            if snapshot.phy == nil, let p = sec.phy {
+                snapshot.phy = p
+                sources["phy"] = FieldOrigin.knownNetworks.rawValue
             }
         }
     }
@@ -830,50 +992,71 @@ private enum KnownNetworksStore {
         return data
     }
 
-    private static func inferSSID(store: [String: Any], env: EnvironmentInfo, currentChannel: Int?) -> String? {
-        var candidates: [(score: Double, time: Date, ssid: String)] = []
+    private struct SSIDInference {
+        let value: String
+        let lastAssociated: Date?
+        let score: Double
+    }
+
+    private static func inferSSID(store: [String: Any], env: EnvironmentInfo, currentChannel: Int?) -> SSIDInference? {
+        var candidates: [SSIDInference] = []
         let targetDHCP = env.dhcpServerIPv4.flatMap { ipv4Data(from: $0) }
         let router = env.routerIPv4
+        let epoch = Date(timeIntervalSince1970: 0)
 
         for (_, value) in store {
             guard let network = value as? [String: Any] else { continue }
             guard let rawSSID = extractSSID(from: network) else { continue }
+
             var baseScore: Double = 0.0
-            var bestDate = Date(timeIntervalSince1970: 0)
+            var bestDate = epoch
 
             if let bssList = network["BSSList"] as? [[String: Any]] {
                 for entry in bssList {
                     if let data = entry["DHCPServerID"] as? Data, let target = targetDHCP, data == target {
-                        baseScore = max(baseScore, 0.9)
+                        baseScore = max(baseScore, 0.85)
                         if let date = entry["LastAssociatedAt"] as? Date { bestDate = max(bestDate, date) }
                     }
-                    if baseScore < 0.7, let sig = entry["IPv4NetworkSignature"] as? String, let router = router, sig.contains("IPv4.Router=\(router)") {
-                        baseScore = max(baseScore, 0.7)
+                    if baseScore < 0.72,
+                       let signature = entry["IPv4NetworkSignature"] as? String,
+                       let router,
+                       signature.contains("IPv4.Router=\(router)") {
+                        baseScore = max(baseScore, 0.72)
                         if let date = entry["LastAssociatedAt"] as? Date { bestDate = max(bestDate, date) }
                     }
-                    if baseScore < 0.5, let channel = currentChannel, let bssChannel = entry["Channel"] as? Int, channel == bssChannel {
-                        baseScore = max(baseScore, 0.5)
+                    if baseScore > 0.0,
+                       let channel = currentChannel,
+                       let bssChannel = entry["Channel"] as? Int,
+                       channel == bssChannel {
+                        baseScore = min(baseScore + 0.05, 1.0)
                         if let date = entry["LastAssociatedAt"] as? Date { bestDate = max(bestDate, date) }
                     }
                 }
             }
 
-            if baseScore == 0.0 {
-                if let meta = network["IPv4NetworkSignature"] as? String, let router = router, meta.contains("IPv4.Router=\(router)") {
-                    baseScore = 0.6
-                }
+            if baseScore < 0.70,
+               let router,
+               let signature = network["IPv4NetworkSignature"] as? String,
+               signature.contains("IPv4.Router=\(router)") {
+                baseScore = max(baseScore, 0.70)
             }
 
             if baseScore > 0.0 {
-                candidates.append((baseScore, bestDate, rawSSID))
+                if bestDate == epoch, let updated = network["UpdatedAt"] as? Date {
+                    bestDate = updated
+                }
+                let lastAssociated = (bestDate > epoch) ? bestDate : nil
+                candidates.append(SSIDInference(value: rawSSID, lastAssociated: lastAssociated, score: baseScore))
             }
         }
 
-        candidates.sort { lhs, rhs in
-            if lhs.score != rhs.score { return lhs.score > rhs.score }
-            return lhs.time > rhs.time
+        guard !candidates.isEmpty else { return nil }
+        return candidates.max { lhs, rhs in
+            if lhs.score != rhs.score { return lhs.score < rhs.score }
+            let lhsDate = lhs.lastAssociated ?? epoch
+            let rhsDate = rhs.lastAssociated ?? epoch
+            return lhsDate < rhsDate
         }
-        return candidates.first?.ssid
     }
 
     private static func entries(forSSID target: String, store: [String: Any]) -> [[String: Any]] {
