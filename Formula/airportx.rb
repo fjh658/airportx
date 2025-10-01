@@ -13,21 +13,12 @@ class Airportx < Formula
     bin.install "airportx"
   end
 
-  def post_install
-    airportx_path = opt_bin / "airportx"
-    ohai "Elevating #{airportx_path} to root:setuid"
-    system "/usr/bin/sudo", "/usr/sbin/chown", "root", airportx_path
-    system "/usr/bin/sudo", "/bin/chmod", "4755", airportx_path
-  end
 
   def caveats
     <<~EOS
-      airportx relies on system-wide Wi-Fi metadata that usually requires root.
-      After installation this formula attempts to run:
-        sudo chown root #{opt_bin}/airportx
-        sudo chmod 4755 #{opt_bin}/airportx
-      You may be prompted for your password. If the commands fail, rerun them
-      manually so airportx can read system Wi-Fi metadata without sudo.
+      airportx does not perform any privilege escalation (no sudo, no setuid).
+      It uses public APIs and best‑effort sources that do not require CoreLocation.
+      If the system restricts access to certain Wi‑Fi metadata, airportx will simply omit those fields; this is expected and not an error.
     EOS
   end
 
