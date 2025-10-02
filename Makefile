@@ -55,23 +55,22 @@ dist: universal
 # Update the Homebrew formula file with the current version and sha256 of the packaged tarball.
 .PHONY: update_formula
 update_formula: dist
-	@formula_file="./Formula/airportx.rb"; \
-	[ -f "$$formula_file" ] || formula_file="airportx.rb"; \
-	if [ -f "$$formula_file" ]; then \
-	  tarball="dist/$(BIN_NAME)-$(VERSION_CLEAN)-universal.tar.gz"; \
-	  new_sha=$$(shasum -a 256 "$$tarball" | awk '{print $$1}'); \
-	  awk -v ver="$(VERSION_CLEAN)" -v sha="$$new_sha" -v tarname="$(BIN_NAME)-$(VERSION_CLEAN)-universal.tar.gz" '\
-	    BEGIN{} \
-	    { \
-	      if ($$0 ~ /^[[:space:]]*version[[:space:]]*"/) { sub(/"[^"]+"/,"\"" ver "\""); } \
-	      if ($$0 ~ /airportx-[0-9.]+-universal\.tar\.gz/) { gsub(/airportx-[0-9.]+-universal\.tar\.gz/, tarname); } \
-	      if ($$0 ~ /^[[:space:]]*sha256[[:space:]]*"/) { sub(/"[a-f0-9]+"/,"\"" sha "\""); } \
-	      print $$0; \
-	    }' "$$formula_file" > "$$formula_file.tmp" && mv "$$formula_file.tmp" "$$formula_file"; \
-	  echo "Formula updated to $(VERSION_CLEAN) with sha256 $$new_sha"; \
-	else \
-	  echo "Formula file not found; skipping update."; \
-	fi
+	@{ \
+	  formula_file="./Formula/airportx.rb"; \
+	  [ -f "$$formula_file" ] || formula_file="airportx/Formula/airportx.rb"; \
+	  [ -f "$$formula_file" ] || formula_file="airportx.rb"; \
+	  if [ -f "$$formula_file" ]; then \
+	    set -e; \
+	    tarball="dist/$(BIN_NAME)-$(VERSION_CLEAN)-universal.tar.gz"; \
+	    new_sha=$$(shasum -a 256 "$$tarball" | awk '{print $$1}'); \
+	    sed -E -i.bak "s/^([[:space:]]*version[[:space:]]*)\"[^\"]+\"/\\1\"$(VERSION_CLEAN)\"/" "$$formula_file"; \
+	    sed -E -i.bak "s/^([[:space:]]*sha256[[:space:]]*)\"[a-f0-9]+\"/\\1\"$$new_sha\"/" "$$formula_file"; \
+	    rm -f "$$formula_file.bak"; \
+	    echo "Formula updated: version=$(VERSION_CLEAN), sha256=$$new_sha"; \
+	  else \
+	    echo "Formula file not found; skipping update."; \
+	  fi; \
+	}
 
 # Build and package, then update the Homebrew formula
 .PHONY: release
