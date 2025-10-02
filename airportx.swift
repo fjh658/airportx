@@ -1,55 +1,56 @@
-//
-//  airportx.swift
-//  Lightweight Wi-Fi inspector for macOS.
-//
-//  OVERVIEW
-//  ---------------------------------------------------------------------------
-//  airportx prints the current Wi-Fi connection details on macOS without
-//  triggering CoreLocation (TCC) or calling the private `airport` command. The
-//  tool follows a strict source-precedence model so that every field originates
-//  from the most authoritative item available:
-//      1) SystemConfiguration dynamic store (runtime network state)
-//      2) CoreWLAN (optional, live telemetry, no scans/power changes)
-//      3) IORegistry (IO80211 interface properties)
-//      4) Known-networks database (system scope) for inference/fallbacks
-//      5) Derived/heuristic values when nothing else is available
-//
-//  DATA SOURCES & SAFETY
-//  ---------------------------------------------------------------------------
-//  • SystemConfiguration dynamic store is read-only.
-//  • CoreWLAN enrichment is best-effort and never initiates scans; it may be
-//    disabled via `--no-live` or denied by TCC, in which case later sources
-//    take over automatically.
-//  • IORegistry queries the `IO80211Interface` plane without persisting state.
-//  • Known-networks plist (/Library/Preferences/com.apple.wifi.known-networks.plist)
-//    is opened with O_NOFOLLOW and root-ownership checks; privileges are dropped
-//    immediately after the file is read.
-//
-//  OUTPUT & CLI
-//  ---------------------------------------------------------------------------
-//  The default output is the SSID; `--json` emits a single ordered JSON object
-//  and `--detail` adds `<key>Source` attributes that expose the provenance of
-//  each field. Dedicated flags (`--ssid`, `--bssid`) print value-only results.
-//  Verbose mode (`-v`) surfaces interface selection heuristics so users can
-//  understand how airportx mapped VPN/tunnel interfaces back to Wi-Fi.
-//
-//  SECURITY PRINCIPLES
-//  ---------------------------------------------------------------------------
-//  • No CoreLocation usage
-//  • No private `airport` binary invocations
-//  • Minimal privilege window for known-networks access
-//  • All derived values (band, SNR) are clearly marked as such in the output
-//
-//  BUILD
-//      make universal
-//
-//  RUNTIME EXAMPLES
-//      sudo ./airportx --json --detail
-//      OR
-//      sudo chown root ./airportx && sudo chmod +s ./airportx
-//      ./airportx --ssid
-//      ./airportx --json --no-live
-//
+
+/*
+ airportx — Wi‑Fi state & reporting (aligned with latest resolver logic)
+
+ State machine
+ - powerOff
+ - unassociated
+ - associatedNoRuntime
+ - associatedOnline
+
+ Evidence & precedence
+ - CoreWLAN: only SSID/BSSID count as association (wlanChannel alone is not proof).
+ - SystemConfiguration (runtime): Router or DHCP from the dynamic store counts as runtime evidence.
+ - IORegistry: radio/environment properties; scrubbed when offline.
+ - Known Networks (system scope): /Library/Preferences/com.apple.wifi.known-networks.plist
+   Used only on degraded/fallback path; reading requires sudo (or setuid root). We open with O_NOFOLLOW
+   and verify root ownership; any temporary privileges are dropped immediately. If not permitted, this source is skipped.
+ - Derived: band from channel, snr from rssi−noise.
+
+ Early exits
+ 1) powerOff (CWInterface.powerOn() == false) → state=powerOff, return.
+ 2) Selected interface is not Wi‑Fi → state=unassociated, return.
+ 3) Radio on but no CoreWLAN SSID/BSSID and no runtime evidence → state=unassociated, return.
+
+ Backstop scrub (post-merge)
+ - When no runtime and no CoreWLAN SSID/BSSID, clear potentially stale fields:
+   ssid, bssid, rssi, noise, snr, txRate, security, phy, channel, band, ssidLastSeen.
+
+ Output policy
+ - Default (`airportx`):
+   STATE=<state>
+   SSID=<ssid>               # only when state == associatedOnline
+ - Value-only (`--ssid`, `--bssid`):
+   Always print STATE=<state>, and only print requested values when state == associatedOnline.
+ - JSON (`--json`):
+   Always emit an object with "state" and "iface". Optional fields appear only when known.
+   `--detail` adds `<key>Source` origin keys (CoreWLAN/SystemConfiguration/IORegistry/KnownNetworks/Derived).
+ - `--state`: prints only the consolidated state.
+ - `-v` / `--verbose`: prints selection diagnostics to stderr.
+
+ Notes
+ - SSID nil ≠ radio off.
+ - wlanChannel may be non-nil while unassociated; do not treat it as association evidence.
+ - Version string is declared in this file as: `private static let version = "…"`.
+
+ ./airportx
+ ./airportx --ssid
+ ./airportx --bssid
+ ./airportx --ssid --bssid
+ ./airportx --json --detail
+ ./airportx --json --no-live
+ ./airportx --state
+*/
 
 import Foundation
 import SystemConfiguration
@@ -107,6 +108,7 @@ private struct Ansi {
 /// can be enforced by a custom `encode(to:)` implementation.
 private struct WiFiSnapshot {
     var iface: String = ""
+    var state: String?
     var serviceID: String?
     var ssid: String?
     var ssidLastSeen: Date?
@@ -192,6 +194,39 @@ private struct EnvironmentInfo {
 /// Callers receive both the resolved snapshot and a dictionary describing where
 /// each field came from (when available).
 private final class WiFiResolver {
+    /// Query radio power state via CoreWLAN without triggering scans.
+    /// Returns true/false when known, or nil if CoreWLAN/interface is unavailable.
+    private static func radioPowerOn(iface: String) -> Bool? {
+#if canImport(CoreWLAN)
+        let client = CWWiFiClient.shared()
+        let cw = client.interface(withName: iface) ?? client.interface()
+        return cw?.powerOn()
+#else
+        return nil
+#endif
+    }
+    /// Early offline gate: if there's no runtime evidence and no live CoreWLAN,
+    /// return true to skip all later enrichments (IORegistry/KnownNetworks).
+    private static func shouldEarlyExitOffline(env: EnvironmentInfo, liveCoreWLAN: Bool) -> Bool {
+        let hasRuntime = (env.routerIPv4 != nil) || (env.dhcpOrigin == .systemConfiguration)
+        var hasLiveCW = false
+#if canImport(CoreWLAN)
+        if liveCoreWLAN {
+            let client = CWWiFiClient.shared()
+            let interface = client.interface(withName: env.iface) ?? client.interface()
+            if let cw = interface {
+                if let s = cw.ssid(), !s.isEmpty { hasLiveCW = true }
+                else if let ch = cw.wlanChannel()?.channelNumber, ch > 0 { hasLiveCW = true }
+            }
+        }
+#endif
+        // If selected interface isn't Wi‑Fi, we still treat as "unassociated"
+        // unless CoreWLAN proves a live link.
+        if !env.isWiFi {
+            return !hasLiveCW
+        }
+        return !hasRuntime && !hasLiveCW
+    }
     /// Produce a snapshot for the requested interface (or the best Wi-Fi choice)
     /// using the configured source precedence. The `liveCoreWLAN` parameter lets
     /// callers disable CoreWLAN enrichment (`--no-live`).
@@ -212,6 +247,39 @@ private final class WiFiResolver {
             assignIfEmpty(&snapshot.dhcpSource, key: "dhcpSource", value: env.dhcpSource, origin: .systemConfiguration, sources: &sources)
         }
 
+        // ---- Early state gate (power / association / runtime) ----
+        // 1) Radio power
+        if let power = radioPowerOn(iface: env.iface), power == false {
+            snapshot.state = "powerOff"
+            return (snapshot, sources)
+        }
+        // 2) Runtime evidence (router or DHCP from SystemConfiguration)
+        let hasRuntime = (env.routerIPv4 != nil) || (env.dhcpOrigin == .systemConfiguration)
+        // 3) Association evidence from CoreWLAN (only SSID/BSSID; channel is unreliable for association)
+        var preAssocCW: Bool? = nil
+#if canImport(CoreWLAN)
+        if liveCoreWLAN {
+            let client = CWWiFiClient.shared()
+            let interface = client.interface(withName: env.iface) ?? client.interface()
+            if let cw = interface {
+                let ss = cw.ssid()
+                let bb = cw.bssid()
+                preAssocCW = (bb != nil) || (ss != nil && !(ss!.isEmpty))
+            }
+        }
+#endif
+        // 4) Not a Wi‑Fi selection → treat as unassociated
+        if !env.isWiFi {
+            snapshot.state = "unassociated"
+            return (snapshot, sources)
+        }
+        // 5) If we can tell we're not associated and also have no runtime, exit early as unassociated
+        if let assoc = preAssocCW, assoc == false, !hasRuntime {
+            snapshot.state = "unassociated"
+            return (snapshot, sources)
+        }
+        // ----------------------------------------------------------
+
         #if canImport(CoreWLAN)
         if liveCoreWLAN && env.isWiFi {
             CoreWLANReader.populate(into: &snapshot,
@@ -229,6 +297,10 @@ private final class WiFiResolver {
             KnownNetworksStore.enrich(into: &snapshot, sources: &sources, env: env)
         }
 
+        // If we appear to be offline/unassociated, purge stale fields inferred
+        // from IORegistry/KnownNetworks so output reflects the current state.
+        scrubIfUnassociated(snapshot: &snapshot, sources: &sources, env: env)
+
         if let channel = snapshot.channel {
             assignIfEmpty(&snapshot.band, key: "band", value: BandCalculator.band(for: channel), origin: .derived, sources: &sources)
         }
@@ -236,7 +308,54 @@ private final class WiFiResolver {
             assignIfEmpty(&snapshot.snr, key: "snr", value: rssi - noise, origin: .derived, sources: &sources)
         }
 
+        // ---- Final state stamping ----
+        let hasRuntime2 = (env.routerIPv4 != nil) || (env.dhcpOrigin == .systemConfiguration)
+        let assocCWPost = (sources["bssid"] == FieldOrigin.coreWLAN.rawValue) || (sources["ssid"] == FieldOrigin.coreWLAN.rawValue)
+        if let power = radioPowerOn(iface: env.iface), power == false {
+            snapshot.state = "powerOff"
+        } else if hasRuntime2 {
+            snapshot.state = "associatedOnline"
+        } else if assocCWPost {
+            snapshot.state = "associatedNoRuntime"
+        } else {
+            snapshot.state = "unassociated"
+        }
+        // --------------------------------
+
         return (snapshot, sources)
+    }
+
+    private static func scrubIfUnassociated(snapshot: inout WiFiSnapshot,
+                                             sources: inout FieldSources,
+                                             env: EnvironmentInfo) {
+        // Only treat CoreWLAN SSID/BSSID as live association evidence; channel alone is not reliable.
+        let hasRuntime = (env.routerIPv4 != nil) || (env.dhcpOrigin == .systemConfiguration)
+        let ssidOrigin = sources["ssid"]
+        let bssidOrigin = sources["bssid"]
+        let hasLiveSSID  = (ssidOrigin == FieldOrigin.coreWLAN.rawValue)
+        let hasLiveBSSID = (bssidOrigin == FieldOrigin.coreWLAN.rawValue)
+
+        // Consider non‑Wi‑Fi selections and lack of runtime+live association as offline → scrub.
+        let likelyOffline = (!env.isWiFi) || (!hasRuntime && !hasLiveSSID && !hasLiveBSSID)
+        if likelyOffline {
+            // Drop fields that are often stale when pulled from IORegistry or
+            // KnownNetworks, so CLI output falls back to "Unknown (not associated)"
+            snapshot.ssid = nil
+            snapshot.bssid = nil
+            snapshot.rssi = nil
+            snapshot.noise = nil
+            snapshot.snr = nil
+            snapshot.txRate = nil
+            snapshot.security = nil
+            snapshot.phy = nil
+            snapshot.channel = nil
+            snapshot.band = nil
+            snapshot.ssidLastSeen = nil
+
+            for k in ["ssid","bssid","rssi","noise","snr","txRate","security","phy","channel","band"] {
+                sources.removeValue(forKey: k)
+            }
+        }
     }
 }
 
@@ -918,6 +1037,14 @@ private enum KnownNetworksStore {
 
     static func enrich(into snapshot: inout WiFiSnapshot, sources: inout FieldSources, env: EnvironmentInfo) {
         guard env.isWiFi else { return }
+        // Origin-aware offline heuristic:
+        // - Only treat SystemConfiguration DHCP as runtime (ignore lease-file/heuristic)
+        // - Require a live CoreWLAN channel to consider the radio "active"
+        let noRuntime = (env.routerIPv4 == nil) && (env.dhcpOrigin != .systemConfiguration)
+        let channelIsLive = (sources["channel"] == FieldOrigin.coreWLAN.rawValue)
+        if noRuntime && !channelIsLive {
+            return
+        }
 
         // Determine if we need KnownNetworks at all *before* touching disk.
         var needSSID = (snapshot.ssid == nil || snapshot.ssid?.isEmpty == true)
@@ -1251,6 +1378,9 @@ private struct JSONEmitter {
         }
 
         var items: [(String, String, ValueKind)] = []
+        let stateEncoded = encode(snapshot.state ?? "unknown")
+        items.append(("state", stateEncoded, .string))
+
         let ifaceEncoded = encode(snapshot.iface)
         items.append(("iface", ifaceEncoded, .string))
         if let sources = sources, let origin = sources["iface"] {
@@ -1283,7 +1413,7 @@ private struct JSONEmitter {
         add("ssid", value: snapshot.ssid)
         add("txRate", value: snapshot.txRate)
 
-        let prefixCount = (sources == nil) ? 1 : 2
+        let prefixCount = (sources == nil) ? 2 : 3
         let head = items.prefix(prefixCount)
         var tail = Array(items.dropFirst(prefixCount))
         tail.sort { $0.0 < $1.0 }
@@ -1477,6 +1607,7 @@ private struct CLIOptions {
     var detail: Bool = false
     var ssidOnly: Bool = false
     var bssidOnly: Bool = false
+    var stateOnly: Bool = false
     var live: Bool = true
 }
 
@@ -1503,6 +1634,8 @@ private func parseCLI() -> CLIOptions {
             options.ssidOnly = true
         case "--bssid":
             options.bssidOnly = true
+        case "--state":
+            options.stateOnly = true
         case "--no-live":
             options.live = false
         case "--no-color":
@@ -1559,7 +1692,7 @@ private func fail(_ message: String) -> Never {
 /// Command-line entry point for airportx. Dispatches to the resolver, manages
 /// output format, and implements interface selection error handling.
 struct AirportXCLI {
-    private static let version = "0.0.1"
+    private static let version = "0.0.2"
 
     static func main() {
         let options = parseCLI()
@@ -1573,27 +1706,43 @@ struct AirportXCLI {
                 fputs("error: interface '\(options.interface)' not found\n", stderr)
                 exit(3)
             }
-            
+
             let (snapshot, sources) = WiFiResolver.collect(preferredInterface: options.interface,
-                                                                       strict: options.explicitInterface,
-                                                                 liveCoreWLAN: options.live)
+                                                           strict: options.explicitInterface,
+                                                           liveCoreWLAN: options.live)
             if options.verbose {
                 fputs(verboseReport(snapshot: snapshot,
                                  preferIface: options.interface,
-                                      strict: options.explicitInterface) + "\n", stderr)
+                                 strict: options.explicitInterface) + "\n", stderr)
             }
-            
+
             if options.json {
+                // JSON always as an object with state + optional fields
                 JSONEmitter.emit(snapshot: snapshot, sources: options.detail ? sources : nil)
-            } else if options.ssidOnly && options.bssidOnly {
-                print("SSID=\(snapshot.ssid ?? "Unknown (not associated)")")
-                print("BSSID=\(snapshot.bssid ?? "-")")
-            } else if options.ssidOnly {
-                print(snapshot.ssid ?? "Unknown (not associated)")
-            } else if options.bssidOnly {
-                print(snapshot.bssid ?? "-")
+            } else if options.stateOnly {
+                // Explicit state-only output
+                print(snapshot.state ?? "unassociated")
+            } else if options.ssidOnly || options.bssidOnly {
+                // Value-only modes: always surface state; only print SSID/BSSID when associatedOnline
+                let state = snapshot.state ?? "unassociated"
+                print("STATE=\(state)")
+                if state == "associatedOnline" {
+                    if options.ssidOnly, let ssid = snapshot.ssid {
+                        print("SSID=\(ssid)")
+                    }
+                    if options.bssidOnly, let bssid = snapshot.bssid {
+                        print("BSSID=\(bssid)")
+                    }
+                }
             } else {
-                print(snapshot.ssid ?? "Unknown (not associated)")
+                // Default human-readable: Always print STATE=..., and only print SSID when associatedOnline
+                let state = snapshot.state ?? "unassociated"
+                print("STATE=\(state)")
+                if state == "associatedOnline" {
+                    if let ssid = snapshot.ssid {
+                        print("SSID=\(ssid)")
+                    }
+                }
             }
         }
     }
@@ -1613,6 +1762,7 @@ struct AirportXCLI {
             "  --detail           With --json, also emit <key>Source fields",
             "  --ssid             Print only the SSID",
             "  --bssid            Print only the BSSID",
+            "  --state            Print only the consolidated state (powerOff/unassociated/associatedNoRuntime/associatedOnline)",
             "  --no-live          Disable CoreWLAN enrichment",
             "  --no-color         Disable ANSI colors in verbose output",
             "",

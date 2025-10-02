@@ -1,12 +1,12 @@
 class Airportx < Formula
   desc "Wi-Fi inspector for macOS without CoreLocation"
   homepage "https://github.com/fjh658/airportx"
-  version "0.0.1"
+  version "0.0.2"
   def self.local_tarball
-    Pathname.new(__dir__).join("../dist/airportx-0.0.1-universal.tar.gz").realpath.to_s
+    Pathname.new(__dir__).join("../dist/airportx-… 0.0.2-universal.tar.gz").realpath.to_s
   end
   url "file://#{Airportx.local_tarball}"
-  sha256 "685b2494cc2872a7eada9c9787db83f53f8f43e65e9d645134134be2bbb07282"
+  sha256 "c893fb424648434dae0edcd15f28ba38633fb61a78e5762ecaaf7dd215cbf871"
   head "https://github.com/fjh658/airportx.git", branch: "main"
 
   def install
