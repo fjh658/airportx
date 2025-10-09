@@ -1710,7 +1710,7 @@ private func fail(_ message: String) -> Never {
 /// Command-line entry point for airportx. Dispatches to the resolver, manages
 /// output format, and implements interface selection error handling.
 struct AirportXCLI {
-    private static let version = "0.0.2"
+    private static let version = "0.0.3"
 
     static func main() {
         let options = parseCLI()
