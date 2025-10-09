@@ -881,94 +881,112 @@ private enum CoreWLANReader {
                   .replacingOccurrences(of: "‘", with: "'")
                   .trimmingCharacters(in: .whitespacesAndNewlines)
     }
-
-    // Ranked BSSID selection from profile: DHCP match > router signature > channel > recency
+    
+    /// Select the best BSSID using CoreWLAN's in-memory `networkProfiles`.
+    /// Scoring: DHCP(+300) > RouterSig(+200 if DHCP not already matched) > Channel(+100) > recency(AssociatedAt).
+    /// Keys by layer:
+    ///   - Profile (KVC-safe): "ssid", "bssidList" (fallback "_bssidList")
+    ///   - Entry(dict): "BSSID", "DHCPServerID", "Channel", "IPv4NetworkSignature", "AssociatedAt"
     private static func bssidFromProfiles(_ cw: CWInterface,
                                           expectedChannel: Int?,
                                           expectedRouter: String?,
                                           expectedDHCP: String?) -> String? {
+
+        // Verbose flag from CLI; when not present, logging is fully suppressed.
+        let _argv = CommandLine.arguments
+        let _verbose = _argv.contains("-v") || _argv.contains("--verbose")
+        @inline(__always) func vlog(_ s: @autoclosure () -> String) { if _verbose { print(s()) } }
+
         guard let cfg = cw.configuration(),
-              let set = (cfg.value(forKey: "networkProfiles") as? NSOrderedSet) else {
+              let profiles = (cfg.value(forKey: "networkProfiles") as? NSOrderedSet)?.array as? [NSObject] else {
             return nil
         }
 
-        // Filter to the profile matching the current SSID when available
         let targetSSID: String? = cw.ssid().flatMap { normalizeSSIDLocal($0) }
-        let dhcpTarget: Data? = expectedDHCP.flatMap { ipv4Data(from: $0) }
+        let dhcpTarget: Data?   = expectedDHCP.flatMap { ipv4Data(from: $0) }
+
+        // header line for verbose log
+        let chanStr = expectedChannel.map(String.init) ?? "nil"
+        vlog("BSSID.expected channel=\(chanStr) router=\(expectedRouter ?? "nil") dhcp=\(expectedDHCP ?? "nil") ssid=\(targetSSID ?? "nil")")
 
         var bestBSSID: String? = nil
         var bestRank: Int = .min
         var bestDate: Date = .distantPast
 
-        for case let profile as NSObject in set {
+        // util for printing
+        let isoF = ISO8601DateFormatter()
+        isoF.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        @inline(__always)
+        func iso(_ d: Date?) -> String { d.map { isoF.string(from: $0) } ?? "nil" }
+        @inline(__always)
+        func ipv4(_ d: Data?) -> String {
+            guard let d = d, d.count == 4 else { return "nil" }
+            return d.map { String($0) }.joined(separator: ".")
+        }
+
+        for profile in profiles {
+            // optional SSID filter
             if let t = targetSSID,
                let pSSID = (profile.value(forKey: "ssid") as? String).flatMap({ normalizeSSIDLocal($0) }),
                !pSSID.isEmpty, pSSID != t {
                 continue
             }
 
-            guard let list = profile.value(forKey: "bssidList") as? [[String: Any]] else { continue }
+            // bssidList (or _bssidList)
+            let listAny = (profile.value(forKey: "bssidList") as Any?)
+                       ?? (profile.value(forKey: "_bssidList") as Any?)
+            guard let list = listAny as? [[String: Any]], !list.isEmpty else { continue }
+
+            var idx = 0
             for entry in list {
+                idx += 1
                 guard let raw = (entry["BSSID"] as? String)?.lowercased(),
-                      let bssid = normalizeBSSIDString(raw) else { continue }
-
-                var rank = 0
-
-                // 1) Exact DHCP server match (strongest signal)
-                if let data = entry["DHCPServerID"] as? Data, let target = dhcpTarget, data == target {
-                    rank += 300
+                      let bssid = normalizeBSSIDString(raw) else {
+                    vlog("BSSID.candidate[\(idx)] invalidBSSID=1")
+                    continue
                 }
 
-                // 2) Router signature match
+                var rank = 0
+                var rDHCP = 0, rRouter = 0, rChan = 0
+
+                // (1) DHCP exact match
+                let dh = entry["DHCPServerID"] as? Data
+                if let target = dhcpTarget, dh == target { rDHCP = 300; rank += rDHCP }
+
+                // (2) Router signature match (entry only; skip if DHCP already matched)
+                var routerMatch = false
                 if rank < 300, let router = expectedRouter,
                    let sig = entry["IPv4NetworkSignature"] as? String,
                    sig.contains("IPv4.Router=\(router)") {
-                    rank += 200
+                    routerMatch = true
+                    rRouter = 200; rank += rRouter
                 }
 
-                // 3) Channel match
-                if let exp = expectedChannel {
-                    if let n = entry["Channel"] as? NSNumber, n.intValue == exp { rank += 100 }
-                    else if let n = entry["Channel"] as? Int, n == exp { rank += 100 }
-                }
+                // (3) Channel match
+                let chNum: NSNumber? = (entry["Channel"] as? NSNumber) ?? ((entry["Channel"] as? Int).map(NSNumber.init(value:)))
+                if let exp = expectedChannel, let ch = chNum, ch.intValue == exp { rChan = 100; rank += rChan }
 
-                // 4) Recency (prefer most recent association; accept multiple possible keys)
-                let ts = dateFromBSSIDEntry(entry) ?? .distantPast
+                // (4) Recency: AssociatedAt only
+                let ts = (entry["AssociatedAt"] as? Date) ?? .distantPast
 
+                // per-candidate line
+                vlog("BSSID.candidate[\(idx)] bssid=\(bssid) channel=\(chNum?.intValue.description ?? "nil") dhcp=\(ipv4(dh)) routerMatch=\(routerMatch) rank=\(rank) components=DHCP:\(rDHCP),Router:\(rRouter),Channel:\(rChan) associatedAt=\(ts == .distantPast ? "nil" : iso(ts))")
+
+                // keep best (rank → timestamp)
                 if rank > bestRank || (rank == bestRank && ts > bestDate) {
-                    bestRank = rank
-                    bestDate = ts
+                    bestRank  = rank
+                    bestDate  = ts
                     bestBSSID = bssid
                 }
             }
         }
 
-        return bestBSSID
-    }
-
-    // Extract a useful timestamp from a BSS entry; different macOS versions use different keys
-    @inline(__always)
-    private static func dateFromBSSIDEntry(_ entry: [String: Any]) -> Date? {
-        let keys = [
-            "LastAssociatedAt",
-            "lastAssociatedAt",
-            "LastJoinedAt",
-            "LastJoined",
-            "LastSeen",
-            "Timestamp",
-            "AWDLRealTimeModeTimestamp"
-        ]
-        var best: Date? = nil
-        for k in keys {
-            if let d = entry[k] as? Date {
-                if let cur = best {
-                    if d > cur { best = d }
-                } else {
-                    best = d
-                }
-            }
+        if let b = bestBSSID {
+            vlog("BSSID.selected bssid=\(b) rank=\(bestRank) associatedAt=\(bestDate == .distantPast ? "nil" : iso(bestDate))")
+        } else {
+            vlog("BSSID.selected bssid=nil")
         }
-        return best
+        return bestBSSID
     }
 
     @inline(__always) private static func normalizeSSIDLocal(_ text: String) -> String {
